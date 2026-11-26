@@ -110,7 +110,7 @@ async def access_log(request: Request, call_next):
 async def redis_unavailable(request: Request, exc: redis.RedisError):
     # Không đếm được rate limit / budget thì từ chối (fail closed), không cho gọi LLM tự do.
     log_event("redis_error", logging.ERROR, path=request.url.path,
-              error=f"{type(exc).__name__}: {exc}"[:200])
+              error=redis_client.sanitize_error(exc))
     return JSONResponse(status_code=503, content={"detail": "Service temporarily unavailable"},
                         headers={"Retry-After": "5"})
 

@@ -9,9 +9,31 @@ không được làm worker chết lúc import: uvicorn sẽ khởi động lạ
 khi dashboard vẫn báo deploy thành công. Thay vào đó coi như Redis không dùng được:
 /ready → 503, /ask → 503, và lifespan ghi log lỗi cấu hình.
 """
+import re
+from urllib.parse import urlsplit
+
 import redis
 
 from app.config import settings
+
+_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/@\s]*@")
+
+
+def _redis_password() -> str:
+    try:
+        return urlsplit(settings.redis_url).password or ""
+    except ValueError:
+        return ""
+
+
+def sanitize_error(exc: BaseException) -> str:
+    """Mô tả lỗi an toàn để ghi log: bỏ user:password trong mọi URL và mật khẩu Redis
+    nếu nó xuất hiện ở bất kỳ đâu. Giữ lại host:port để vẫn chẩn đoán được."""
+    text = _USERINFO.sub(r"\1***@", f"{type(exc).__name__}: {exc}")
+    password = _redis_password()
+    if password:
+        text = text.replace(password, "***")
+    return text[:200]
 
 
 class _InvalidRedisConfig:
@@ -30,9 +52,9 @@ try:
         health_check_interval=30,
     )
     config_error: str | None = None
-except ValueError as exc:  # không đưa URL vào thông báo: URL chứa mật khẩu Redis
+except ValueError as exc:
     r = _InvalidRedisConfig()
-    config_error = str(exc)
+    config_error = sanitize_error(exc)
 
 
 def ping_error() -> str | None:
@@ -41,7 +63,7 @@ def ping_error() -> str | None:
         r.ping()
         return None
     except redis.RedisError as exc:
-        return f"{type(exc).__name__}: {exc}"[:200]
+        return sanitize_error(exc)
 
 
 def redis_healthy() -> bool:
