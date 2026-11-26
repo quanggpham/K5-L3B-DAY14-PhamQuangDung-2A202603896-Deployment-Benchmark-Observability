@@ -244,6 +244,63 @@ Server: nginx
 - **Stack khai báo Redis và Qdrant nhưng `main.py` chưa dùng tới.** Biến `REDIS_URL` và `QDRANT_URL` được truyền vào nhưng code không đọc. Stack này chỉ minh hoạ cách ghép các service. State thật trong Redis được làm ở Part 5 và Part 6.
 - **Log của app chưa phải JSON hợp lệ.** Đây là lỗi dấu `"` lồng nhau giống Part 1: `{"time":"...","level":"INFO","msg":"{"event": "request", "q_len": 2}"}`.
 
+## Part 3: Cloud Deployment
+
+Theo CHECKPOINTS CP6, lớp K5 deploy luôn agent Part 6 (`06-lab-complete/`), không deploy app mẫu ở `03-cloud-deployment/`.
+
+### Exercise 3.1: Railway deployment
+
+- **URL:** https://k5-l3b-day14-phamquangdung-2a202603896-deploymen-production.up.railway.app
+- **Chi tiết, lệnh test, biến môi trường:** [DEPLOYMENT.md](DEPLOYMENT.md)
+- **Screenshot:** [dashboard](screenshots/dashboard.png) · [running](screenshots/running.png) · [test](screenshots/test.png)
+
+4 lệnh tự kiểm của CP6:
+
+```text
+GET  /health                  → 200   {"status":"ok","version":"1.0.0","environment":"production",...}
+GET  /ready                   → 200   {"ready":true,"redis":"ok"}
+POST /ask (không có key)      → 401
+POST /ask (X-API-Key đúng)    → 200   {"question":"What is deployment?","answer":"Deployment là quá trình đưa code ..."}
+```
+
+Trên cloud, sau 10 request trong một phút, request tiếp theo trả `429` kèm `retry-after: 43`. State rate limit nằm trong Redis của Railway.
+
+**Các lỗi gặp khi deploy và cách xử lý:**
+
+Năm lỗi dưới đây được ghi theo nhóm nguyên nhân, không theo đúng thứ tự xảy ra.
+
+1. **Bị chặn vì "unusual activity".** `railway up` bằng CLI trên tài khoản đầu tiên báo *"We limited this workspace after detecting unusual activity. Upgrade to a paid plan..."*. Mình chuyển sang tài khoản khác và deploy qua giao diện web từ GitHub.
+2. **Build nhầm Dockerfile.** Chưa đặt Root Directory nên Railway build `Dockerfile` ở gốc repo. File đó là ví dụ Go, chạy `go build` và fail vì không có `go.mod`. Cách sửa: đặt **Root Directory = `06-lab-complete`**. Không sửa được bằng file `railway.toml` ở gốc repo, vì build context vẫn là gốc repo và các lệnh `COPY app/` sẽ không tìm thấy thư mục.
+3. **`REDIS_URL` không hợp lệ.** Deploy Logs báo `ValueError: Redis URL must specify one of the following schemes`: tham chiếu biến bị thay thành chuỗi rỗng, nên cả hai worker chết lúc import, uvicorn khởi động lại chúng liên tục. Dashboard vẫn báo deploy thành công, vì process cha của uvicorn còn sống và health check lúc đó chưa được cấu hình. Đã sửa code (`app/redis_client.py`): `REDIS_URL` sai thì app vẫn chạy, `/ready` và `/ask` trả 503, và log ghi `config_error`. Sau đó dùng log `redis_unavailable` (đã che mật khẩu) để tìm ra lỗi kết nối.
+4. **Redis nằm khác project với agent.** `/health` trả 200 nhưng `/ready` trả 503 ngay lập tức (0.4 giây). Lỗi là `redis.railway.internal` không phân giải được (`Name or service not known`): tên miền `*.railway.internal` và tham chiếu `${{Redis.REDIS_URL}}` chỉ dùng được giữa các service **cùng project và cùng environment**. Đây cũng là lý do tham chiếu ở bước 3 bị thay thành chuỗi rỗng. Sau khi chuyển Redis về cùng project với agent: `/ready` → 200.
+5. **Gõ nhầm Healthcheck Path** thành `/heath`: mọi lần health check nhận 404, deploy fail. Sửa thành `/health`.
+
+### Exercise 3.2: So sánh `railway.toml` và `render.yaml`
+
+Mình viết cả hai file cho agent Part 6 ([railway.toml](06-lab-complete/railway.toml), [render.yaml](06-lab-complete/render.yaml)). Chỉ deploy thật bằng Railway; `render.yaml` mới qua kiểm tra tĩnh của script chấm, chưa deploy thử.
+
+| Khía cạnh | `railway.toml` | `render.yaml` | Vì sao khác |
+|---|---|---|---|
+| Phạm vi | Cấu hình **một service**: cách build, cách deploy, health check, restart | **Blueprint của cả hạ tầng**: service web + Redis (Key Value) + biến môi trường + liên kết giữa chúng | Railway tạo service và database trên dashboard hoặc CLI, file chỉ mô tả từng service. Render dựng toàn bộ stack từ một file khi chạy Blueprint |
+| Build | `builder = "DOCKERFILE"`, `dockerfilePath` | `runtime: docker`, `rootDir`, `dockerfilePath`, `dockerContext` | Render đọc file từ gốc repo nên phải tự khai báo thư mục con. Railway đặt Root Directory trên giao diện |
+| Health check | `healthcheckPath = "/health"`, `healthcheckTimeout` | `healthCheckPath: /health` | Giống nhau về ý nghĩa: nền tảng chỉ chuyển traffic sang bản mới khi `/health` trả 200 |
+| Restart | `restartPolicyType = "ON_FAILURE"`, `restartPolicyMaxRetries` | Không khai báo, Render tự restart | Railway cho chỉnh chính sách restart. Render quản lý việc này |
+| Biến môi trường và secret | **Không** nằm trong file. Đặt trên tab Variables, tham chiếu bằng `${{Redis.REDIS_URL}}` | Nằm trong file nhưng **không ghi giá trị secret**: `AGENT_API_KEY` dùng `generateValue: true`, `REDIS_URL` dùng `fromService` (lấy `connectionString` của Key Value) | Cả hai đều tránh commit secret. Render để Blueprint tự sinh hoặc liên kết giá trị, Railway để toàn bộ ngoài code |
+| Redis | Tạo riêng: `+ Create → Database → Redis` | Khai báo ngay trong file: `type: keyvalue` (Redis-compatible), `ipAllowList: []` (chỉ mạng nội bộ) | Như dòng "Phạm vi" |
+| Cổng | Railway cấp `PORT` | Render cấp `PORT` (mặc định 10000) | Dockerfile đọc `${PORT:-8000}` nên chạy được trên cả hai, không sửa gì |
+
+Tóm lại: `railway.toml` mô tả cách build và chạy một service, phần còn lại (database, biến, liên kết) làm trên dashboard. `render.yaml` là infrastructure-as-code cho cả hệ thống, dựng lại được toàn bộ chỉ từ repo, nên phải cẩn thận để không có secret nào nằm trong file.
+
+### Exercise 3.3: Pipeline CI/CD trên Cloud Run
+
+Đọc `03-cloud-deployment/production-cloud-run/cloudbuild.yaml` và `service.yaml` (không deploy):
+
+1. **Trigger:** push lên nhánh `main` kích hoạt Cloud Build chạy 4 bước theo thứ tự `waitFor`: **test → build → push → deploy**.
+2. **Test:** chạy trong container `python:3.11-slim`, cài `requirements.txt` cùng `pytest` rồi chạy `pytest tests/`. Test fail thì pipeline dừng, không build image.
+3. **Build và push:** build image với hai tag `:$COMMIT_SHA` và `:latest`, dùng `--cache-from :latest` để tái dùng layer, rồi push lên Container Registry (`gcr.io/$PROJECT_ID/ai-agent`).
+4. **Deploy:** `gcloud run deploy` dùng image gắn **`$COMMIT_SHA`**, không dùng `latest`. Nhờ vậy mỗi bản deploy gắn đúng với một commit và rollback được. Cấu hình kèm theo: region `asia-southeast1`, 1–10 instance (`min-instances=1` để tránh cold start), 512 MiB, 1 CPU, timeout 60 giây. Secret lấy từ **Secret Manager** (`--set-secrets`), không ghi trong code.
+5. **`service.yaml`:** khai báo cùng service đó theo kiểu IaC (Knative). Mỗi instance nhận tối đa 80 request đồng thời. `livenessProbe` gọi `/health`, `startupProbe` gọi `/ready`. `AGENT_API_KEY` và `OPENAI_API_KEY` lấy từ `secretKeyRef`. Áp dụng bằng `gcloud run services replace`.
+
 ## Part 4: API Security
 
 ### Exercise 4.1: API Key authentication (`04-api-gateway/develop`)
@@ -713,3 +770,4 @@ Khi tắt hẳn container Redis, `/ready` mất khoảng 4 giây mới trả 503
 | Part 4 | Dùng Claude Code đọc `auth.py`, `rate_limiter.py`, `cost_guard.py`, viết cost guard lưu trong Redis | Giải thích luồng JWT, thuật toán sliding window, bản `check_budget` dùng `INCRBYFLOAT` nguyên tử | Tự gọi bằng `curl` để thấy 401/403/200/429. Thử sửa payload JWT để kiểm chữ ký. Chạy cost guard với Redis thật, gửi 50 request đồng thời và so với lời giải mẫu (41 request lọt, $20.50 so với 20 request, $10.00) |
 | Part 5 | Dùng Claude Code giải thích liveness và readiness, graceful shutdown, stateless; dựng kịch bản gửi SIGTERM và tắt instance | Cách chạy bản develop trong container Linux để gửi SIGTERM; giải thích độ trễ 14.5 giây khi Nginx thử instance đã chết | Tự chạy và đo: `/health` bị chặn 2.45 giây, request trả 200 sau SIGTERM với exit code 0. Chạy `test_stateless.py`. Tự `docker kill` một instance và đếm lại history (20 message) |
 | Part 6 | Dùng Claude Code đọc `check_production_ready.py` để hiểu từng tiêu chí, rồi viết code cho các TODO trong `06-lab-complete/` (`app/*.py`, Dockerfile, compose, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml`) | Code hoàn chỉnh cho 12 tiêu chí và giải thích các quyết định thiết kế ở trên | Chạy `--static-only`, rồi `--skip-docker`, rồi bản đầy đủ trong WSL: PASS 12/12. Tự test stack compose: 429 vẫn còn sau restart, tắt Redis thì `/ready` trả 503. Chạy container không có Redis để xem `/health` và `/ask` phản hồi thế nào. Không sửa `check_production_ready.py` |
+| Part 3 | Dùng Claude Code đọc lỗi deploy Railway (build nhầm Dockerfile Go, `REDIS_URL` rỗng làm worker liên tục chết và khởi động lại, gõ nhầm healthcheck path), sửa `redis_client.py` để báo lỗi cấu hình thay vì crash, so sánh `railway.toml` với `render.yaml`, tóm tắt pipeline Cloud Run | Hướng dẫn đặt Root Directory và tham chiếu biến, bản sửa code, nội dung `DEPLOYMENT.md` | Tự deploy trên giao diện Railway và tự sửa cấu hình. Chạy 4 lệnh tự kiểm trên URL public (200/200/401/200), thử rate limit trên cloud (429 sau 10 request), chạy `check_production_ready.py --public-url`. Sau mỗi lần sửa code đều chạy lại script chấm: PASS 12/12 |
