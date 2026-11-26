@@ -22,7 +22,6 @@ from app.config import settings
 from app.cost_guard import check_budget, record_cost
 from app.rate_limiter import check_rate_limit
 from app import redis_client
-from app.redis_client import redis_healthy
 from utils.mock_llm import ask as llm_ask
 
 
@@ -110,7 +109,8 @@ async def access_log(request: Request, call_next):
 @app.exception_handler(redis.RedisError)
 async def redis_unavailable(request: Request, exc: redis.RedisError):
     # Không đếm được rate limit / budget thì từ chối (fail closed), không cho gọi LLM tự do.
-    log_event("redis_error", logging.ERROR, path=request.url.path, error=type(exc).__name__)
+    log_event("redis_error", logging.ERROR, path=request.url.path,
+              error=f"{type(exc).__name__}: {exc}"[:200])
     return JSONResponse(status_code=503, content={"detail": "Service temporarily unavailable"},
                         headers={"Retry-After": "5"})
 
@@ -147,7 +147,9 @@ def health():
 @app.get("/ready")
 def ready():
     """Readiness (tiêu chí 5): Redis không kết nối được → 503 để load balancer ngừng gửi traffic."""
-    if not redis_healthy():
+    error = redis_client.ping_error()
+    if error:
+        log_event("redis_unavailable", logging.WARNING, error=error)
         return JSONResponse(status_code=503, content={"ready": False, "redis": "unavailable"})
     return {"ready": True, "redis": "ok"}
 

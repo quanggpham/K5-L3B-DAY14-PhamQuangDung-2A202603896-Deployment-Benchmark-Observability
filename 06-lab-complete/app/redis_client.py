@@ -35,11 +35,17 @@ except ValueError as exc:  # không đưa URL vào thông báo: URL chứa mật
     config_error = str(exc)
 
 
-def redis_healthy() -> bool:
+def ping_error() -> str | None:
+    """None nếu Redis trả lời PING; ngược lại là mô tả lỗi (không chứa mật khẩu)."""
     try:
-        return bool(r.ping())
-    except redis.RedisError:
-        return False
+        r.ping()
+        return None
+    except redis.RedisError as exc:
+        return f"{type(exc).__name__}: {exc}"[:200]
+
+
+def redis_healthy() -> bool:
+    return ping_error() is None
 
 
 def close() -> None:
