@@ -631,6 +631,79 @@ nginx | [error] connect() failed (113: Host is unreachable) while connecting to 
 
 Xong thì dọn stack: `docker compose -p k5-day14-scaling down -v`.
 
+## Part 6: Final Project
+
+`python check_production_ready.py` chạy đầy đủ (có Docker) trong `06-lab-complete/` trên WSL2 (`os.name == "posix"`), Docker 29.3.1:
+
+```text
+================================================================
+  📋 Checklist Deliverable
+     ✅ Dockerfile (multi-stage, < 500 MB)
+     ✅ docker-compose.yml (agent + redis)
+     ✅ .dockerignore
+     ✅ Health check endpoint (GET /health)
+     ✅ Readiness endpoint (GET /ready)
+     ✅ API Key authentication
+     ✅ Rate limiting
+     ✅ Cost guard
+     ✅ Config từ environment variables
+     ✅ Structured logging
+     ✅ Graceful shutdown
+     ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+  Result: 12/12 tiêu chí đạt · 43/43 checks passed
+  🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+================================================================
+```
+
+Một số dòng chi tiết trong output: `image < 500 MB — 63 MB`, `429 sau 5 request thành công (RATE_LIMIT_PER_MINUTE=5)`, `restart agent vẫn bị 429`, `402 ở request thứ 1`, `mọi dòng log của app là JSON hợp lệ — 17 dòng JSON`, `docker stop tắt êm — exit code 0, 0.9s`.
+
+**Các quyết định thiết kế chính:**
+
+- **`/health` và `/ready`:**
+  - `/health` không kiểm Redis. Nếu Redis chết, restart agent cũng không giúp được gì.
+  - `/ready` gọi `PING` tới Redis với timeout 1 giây, không trả lời thì trả 503.
+  - Redis client được tạo lúc import nhưng chưa mở kết nối, nên container vẫn khởi động được khi chưa có Redis.
+- **`/ask` khai báo `def` thay vì `async def`:** FastAPI chạy hàm trong threadpool. Lời gọi LLM chặn luồng không làm đứng event loop, nên `/health` và SIGTERM vẫn được xử lý ngay. Đây là lỗi đã gặp ở Part 5.
+- **Rate limit:**
+  - Thuật toán sliding window, dùng Redis sorted set cho mỗi API key. Key trong Redis là hash SHA-256 của API key, không lưu key gốc.
+  - Ghi request (`ZADD`) rồi đếm (`ZCARD`) trong cùng một transaction `MULTI/EXEC`, nên nhiều worker không cùng lọt qua được.
+  - Request bị từ chối được xoá khỏi cửa sổ. Response 429 có header `Retry-After`.
+- **Cost guard:**
+  - Tổng chi phí của agent được lưu trong `cost:day:YYYY-MM-DD` và `cost:month:YYYY-MM` (giờ UTC), cộng bằng `INCRBYFLOAT` (thao tác nguyên tử, xem Exercise 4.4).
+  - Kiểm `DAILY_BUDGET_USD` và `MONTHLY_BUDGET_USD` *trước* khi gọi LLM, ghi chi phí thật *sau* khi gọi.
+  - Ngày hoặc tháng nằm trong tên key nên tự reset, TTL dọn key cũ.
+- **Mất Redis giữa chừng:** `/ask` trả **503**, không lộ stack trace, và không cho gọi LLM khi không đếm được rate limit và chi phí (fail closed). Mọi lỗi khác trả 500 với thông báo chung.
+- **Log:**
+  - `JsonFormatter` tự viết, dùng `json.dumps`, mỗi dòng là một JSON object.
+  - Middleware ghi `method`, `path`, `status`, `ms`, `request_id` cho mỗi request. Không ghi API key hay nội dung câu hỏi, chỉ ghi độ dài câu hỏi và chi phí.
+- **Graceful shutdown:**
+  - Không tự đăng ký signal handler. uvicorn bắt SIGTERM, chờ request đang chạy xong, rồi chạy phần shutdown của `lifespan` (ghi log, đóng connection pool Redis).
+  - Trong Docker, lệnh `CMD ["sh","-c","exec uvicorn ... --port ${PORT:-8000} --timeout-graceful-shutdown 8"]`: `exec` làm uvicorn thành PID 1. Timeout 8 giây nhỏ hơn 10 giây, là thời gian `docker stop` chờ trước khi gửi SIGKILL.
+- **Dockerfile:** stage builder cài dependencies vào `/opt/venv`. Stage runtime dùng `python:3.11-slim`, chỉ copy venv, `app/`, `utils/`, và chạy bằng user `app`. Kích thước: 63 MB (content), 286 MB (disk usage).
+- **Config:** mọi giá trị đọc từ biến môi trường. `AGENT_API_KEY` không có giá trị mặc định. Thiếu key thì `/ask` trả 401 cho mọi request, và app không chịu khởi động khi `ENVIRONMENT=production`. Compose chỉ đọc secret từ `.env` (nằm trong `.gitignore`).
+
+**Tự test thêm với `docker compose -p k5-day14-final up`** (agent + Redis, `RATE_LIMIT_PER_MINUTE=3`):
+
+```text
+ask 1: 200
+ask 2: 200
+ask 3: 200
+ask 4: 429
+--- restart agent, gọi lại ngay
+ask sau restart: HTTP/1.1 429 Too Many Requests
+retry-after: 56
+--- redis keys
+cost:day:2026-11-26
+cost:month:2026-11
+ratelimit:6c7794735e1ae20ad112c476
+--- dừng redis → /health & /ready
+/health: {"status":"ok","version":"1.0.0","environment":"development","uptime_seconds":2.9} [200]
+/ready: {"ready":false,"redis":"unavailable"} [503]
+```
+
+Khi tắt hẳn container Redis, `/ready` mất khoảng 4 giây mới trả 503 (log `"ms": 4003.7`). Có thể do bước tra DNS tên `redis` trong mạng Docker chậm, chưa xác minh. Kết quả vẫn đúng, nhưng nếu platform đặt timeout health check thấp thì nên lưu kết quả ping trong vài giây.
+
 ## AI log
 
 | Part | Hỏi AI gì | Nhận được gì | Tự sửa / tự kiểm tra |
@@ -639,3 +712,4 @@ Xong thì dọn stack: `docker compose -p k5-day14-scaling down -v`.
 | Part 2 | Dùng Claude Code trả lời câu hỏi về Dockerfile, giải thích multi-stage, vẽ sơ đồ stack Compose, tìm lý do không mở được cổng 80 | Câu trả lời Exercise 2.1, cách dùng file override để đổi cổng Nginx sang 8088 mà không sửa file của đề | Tự build hai image và đo dung lượng bằng `docker images`. Kiểm layer bằng `docker history`, user bằng `whoami`. Chạy stack và gọi qua Nginx bằng `curl`. Kiểm DNS nội bộ từ trong container agent |
 | Part 4 | Dùng Claude Code đọc `auth.py`, `rate_limiter.py`, `cost_guard.py`, viết cost guard lưu trong Redis | Giải thích luồng JWT, thuật toán sliding window, bản `check_budget` dùng `INCRBYFLOAT` nguyên tử | Tự gọi bằng `curl` để thấy 401/403/200/429. Thử sửa payload JWT để kiểm chữ ký. Chạy cost guard với Redis thật, gửi 50 request đồng thời và so với lời giải mẫu (41 request lọt, $20.50 so với 20 request, $10.00) |
 | Part 5 | Dùng Claude Code giải thích liveness và readiness, graceful shutdown, stateless; dựng kịch bản gửi SIGTERM và tắt instance | Cách chạy bản develop trong container Linux để gửi SIGTERM; giải thích độ trễ 14.5 giây khi Nginx thử instance đã chết | Tự chạy và đo: `/health` bị chặn 2.45 giây, request trả 200 sau SIGTERM với exit code 0. Chạy `test_stateless.py`. Tự `docker kill` một instance và đếm lại history (20 message) |
+| Part 6 | Dùng Claude Code đọc `check_production_ready.py` để hiểu từng tiêu chí, rồi viết code cho các TODO trong `06-lab-complete/` (`app/*.py`, Dockerfile, compose, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml`) | Code hoàn chỉnh cho 12 tiêu chí và giải thích các quyết định thiết kế ở trên | Chạy `--static-only`, rồi `--skip-docker`, rồi bản đầy đủ trong WSL: PASS 12/12. Tự test stack compose: 429 vẫn còn sau restart, tắt Redis thì `/ready` trả 503. Chạy container không có Redis để xem `/health` và `/ask` phản hồi thế nào. Không sửa `check_production_ready.py` |
