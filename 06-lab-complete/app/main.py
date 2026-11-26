@@ -21,7 +21,8 @@ from app.auth import verify_api_key
 from app.config import settings
 from app.cost_guard import check_budget, record_cost
 from app.rate_limiter import check_rate_limit
-from app.redis_client import r as redis_conn, redis_healthy
+from app import redis_client
+from app.redis_client import redis_healthy
 from utils.mock_llm import ask as llm_ask
 
 
@@ -75,9 +76,12 @@ async def lifespan(app: FastAPI):
     log_event("startup", version=settings.app_version, environment=settings.environment,
               rate_limit_per_minute=settings.rate_limit_per_minute,
               api_key_configured=bool(settings.agent_api_key))
+    if redis_client.config_error:
+        log_event("config_error", logging.ERROR, variable="REDIS_URL",
+                  error=redis_client.config_error)
     yield
     log_event("shutdown", uptime_seconds=round(time.time() - START_TIME, 1))
-    redis_conn.close()
+    redis_client.close()
 
 
 app = FastAPI(title="Production AI Agent", version=settings.app_version, lifespan=lifespan,
