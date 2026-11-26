@@ -1,0 +1,49 @@
+# Quality gate cho agent Part 7: chạy eval trên golden dataset, fail job nếu chất lượng tụt.
+# run_eval.py trả exit code 1 khi accuracy < --min-accuracy hoặc có câu regression so với
+# --baseline → bước bị fail → PR không merge được (khi bật branch protection "require status checks").
+name: quality-gate
+
+on:
+  pull_request:
+    paths:
+      - "06-lab-complete/benchmark-observability/develop/**"
+  workflow_dispatch:
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: 06-lab-complete/benchmark-observability/develop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start agent v2
+        # MOCK_ERROR_RATE=0: tắt lỗi giả lập để gate không fail ngẫu nhiên vì 503
+        run: |
+          AGENT_VERSION=v2 MOCK_ERROR_RATE=0 PORT=8000 python app.py > agent.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://localhost:8000/health && exit 0; sleep 1; done
+          echo "agent did not start"; cat agent.log; exit 1
+
+      - name: Eval + quality gate
+        # Ngưỡng 85% theo đề; --baseline = report đã commit của bản trước → chặn regression từng câu
+        run: >
+          python eval/run_eval.py --url http://localhost:8000
+          --min-accuracy 0.85
+          --baseline reports/eval_v2_fixed.json
+          --out reports/eval_ci.json
+
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: 06-lab-complete/benchmark-observability/develop/reports/eval_ci.json
