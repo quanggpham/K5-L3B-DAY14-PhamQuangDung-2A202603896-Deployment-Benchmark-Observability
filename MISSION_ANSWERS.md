@@ -437,6 +437,200 @@ Còn một cải tiến nên làm khi tích hợp vào app: gọi `check_budget`
 - Cost guard giới hạn **tổng tiền**. Một user gọi đều 10 request/phút, mỗi request là một prompt dài, vẫn có thể đốt hết ngân sách tháng mà không lần nào bị 429.
 - Ngược lại, một chuỗi request rẻ nhưng dồn dập thì không tốn nhiều tiền, nhưng vẫn làm sập server.
 
+## Part 5: Scaling & Reliability
+
+Python trên Windows không gửi được SIGTERM, nên mình chạy bản develop (`05-scaling-reliability/develop`) trong một container Linux:
+
+```bash
+docker run -d --name day14-p5dev -p 8000:8000 -v "<develop>:/src:ro" -w /src python:3.11-slim \
+  sh -c "pip install -r requirements.txt && exec python app.py"
+```
+
+Dùng `exec` để `python app.py` chạy với PID 1 (`/proc/1/cmdline` → `python app.py`), nhờ đó nhận trực tiếp signal từ `docker kill --signal`.
+
+### Exercise 5.1: Health checks
+
+**Cách cài trong `develop/app.py`:**
+- `GET /health` (dòng 104–144) là *liveness*: process còn chạy thì luôn trả 200, kèm uptime, version và mức dùng RAM (đọc bằng `psutil`). RAM trên 90% thì `status` là `"degraded"`, nhưng mã HTTP vẫn là 200.
+- `GET /ready` (dòng 147–168) là *readiness*: trả **503** khi `_is_ready = False`, tức là lúc chưa khởi động xong hoặc đang tắt. Ngược lại thì trả 200, kèm số request đang xử lý.
+- Ở bản `production/app.py`, `/ready` gọi thêm `_redis.ping()` và trả 503 khi Redis không trả lời (dòng 208–215).
+
+```text
+$ curl -i http://localhost:8000/health
+HTTP/1.1 200 OK
+{"status":"ok","uptime_seconds":0.4,"version":"1.0.0","environment":"development","timestamp":"2026-11-26T08:06:48.799022+00:00","checks":{"memory":{"status":"ok","used_percent":11.0}}}
+
+$ curl -i http://localhost:8000/ready
+HTTP/1.1 200 OK
+{"ready":true,"in_flight_requests":1}
+```
+
+`in_flight_requests` bằng 1 vì middleware đếm cả chính request `/ready` đang chạy.
+
+**`/health` khác `/ready` ở đâu:**
+
+|  | `/health` (liveness) | `/ready` (readiness) |
+|---|---|---|
+| Câu hỏi | Process còn sống không, có bị treo không? | Có nên gửi traffic vào instance này không? |
+| Khi fail | Platform **restart** container | Load balancer **ngừng gửi request** vào instance đó, không restart |
+| Có kiểm dependency (Redis/DB) không? | **Không** | **Có** |
+
+Nếu `/health` cũng kiểm Redis thì khi Redis chết, mọi instance cùng fail liveness và bị restart liên tục. Restart không làm Redis sống lại, chỉ làm hệ thống sập nặng hơn. Đúng ra, `/ready` trả 503 để load balancer tạm bỏ các instance đó ra, chờ Redis hồi phục. Part 6 yêu cầu đúng hành vi này.
+
+**Lỗi phát hiện khi đo:** `/ask` khai báo `async def` nhưng gọi `ask()`, mà `ask()` dùng `time.sleep(3)` (chặn luồng). Hàm này giữ luôn event loop, nên gọi `/health` trong lúc `/ask` đang chạy phải chờ:
+
+```text
+/health trong lúc /ask đang chạy: 200 sau 2.450084s
+```
+
+Platform đặt timeout cho health check, thường 5–10 giây. Chỉ cần vài request chậm cùng lúc là health check timeout, và container bị restart oan. Cách sửa: khai báo `def` thường để FastAPI chạy hàm trong threadpool, hoặc `await run_in_threadpool(ask, question)`.
+
+### Exercise 5.2: Graceful shutdown
+
+**Cách cài:**
+- uvicorn bắt SIGTERM, ngừng nhận kết nối mới, chờ request đang chạy xong (tối đa `timeout_graceful_shutdown=30`), rồi chạy phần shutdown của `lifespan`.
+- Phần shutdown (dòng 54–66) đặt `_is_ready=False`, để `/ready` trả 503 và load balancer ngừng gửi request. Sau đó nó chờ `_in_flight_requests` (do middleware `track_requests` đếm) về 0, rồi mới thoát.
+
+**Test:** gửi `/ask` (mất khoảng 3 giây), tới giây thứ 1 thì gửi SIGTERM:
+
+```text
+t=+1s: gửi SIGTERM tới PID 1                 (docker kill --signal SIGTERM day14-p5dev)
+t=+1.3s: request mới tới /ready:  [000]      → không kết nối được
+{"answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé."}
+→ request: HTTP 200, 3.019823s               → request đang chạy KHÔNG bị cắt
+→ container exit code: 0
+```
+
+Log của container:
+
+```text
+08:07:07.245877165Z INFO:     Shutting down
+08:07:07.245959438Z INFO:     172.17.0.1:34308 - "POST /ask?question=Long%20task HTTP/1.1" 200 OK
+08:07:07.346641121Z INFO:     Waiting for application shutdown.
+08:07:07.346686574Z 2026-11-26 08:07:07,346 INFO 🔄 Graceful shutdown initiated...
+08:07:07.346693802Z 2026-11-26 08:07:07,346 INFO ✅ Shutdown complete
+08:07:07.346698395Z INFO:     Application shutdown complete.
+08:07:07.346807435Z INFO:     Finished server process [1]
+08:07:07.346857296Z 2026-11-26 08:07:07,346 INFO Received signal 15 — uvicorn will handle graceful shutdown
+```
+
+**Nhận xét:**
+- Request đang chạy trả **200** và process thoát với **exit code 0**, đúng yêu cầu graceful shutdown.
+- Dòng `Shutting down` xuất hiện cùng lúc request trả về (08:07:07.245), không phải ở giây thứ 1. Lý do: `time.sleep` đang giữ event loop như ở Exercise 5.1, nên uvicorn chỉ xử lý được SIGTERM khi request xong. Kết quả vẫn đúng, nhưng chỉ là may mắn. Nếu có nhiều request chậm, `/ready` không kịp trả 503.
+- Log `Received signal 15` của `handle_sigterm` hiện ra **cuối cùng**. Lý do: từ bản 0.29, uvicorn tạm thay các signal handler khác bằng handler của nó, chạy xong quy trình shutdown, rồi mới gọi lại handler cũ của app. Vì vậy logic dọn dẹp nên đặt trong `lifespan`, không đặt trong signal handler.
+- Muốn graceful shutdown chạy được trong Docker, uvicorn phải chạy với PID 1. Nghĩa là dùng `CMD [...]` dạng exec form, hoặc `exec` như ở trên. Nếu chạy qua `sh -c` mà không có `exec`, shell nhận SIGTERM nhưng không chuyển tiếp cho uvicorn. Sau 10 giây, Docker gửi SIGKILL và request bị cắt ngang.
+
+### Exercise 5.3: Stateless design
+
+**Đọc `production/app.py`:**
+- Session và conversation history được lưu trong Redis bằng `save_session` (`SETEX session:<id>` với TTL 3600 giây) và `load_session` (`GET`). Instance không giữ gì trong RAM.
+- Mỗi instance có một `INSTANCE_ID` riêng và trả trong trường `served_by`, để thấy request nào do instance nào xử lý.
+
+**Vì sao state trong RAM hỏng khi chạy nhiều instance:**
+- Mỗi instance là một process riêng, với bộ nhớ riêng.
+- Load balancer chia request theo vòng tròn, nên turn 1 vào instance A, turn 2 vào instance B. B không có history của A, nên câu trả lời mất ngữ cảnh.
+- Instance bị restart, crash hoặc scale down thì state trong RAM của nó mất theo.
+- Đưa state ra Redis thì instance nào cũng như nhau. Thêm, bớt, hay tắt một instance đều không ảnh hưởng tới người dùng.
+
+**Vấn đề còn lại trong code mẫu:**
+- **Fallback âm thầm về RAM:** nếu lúc khởi động không kết nối được Redis, app tự chuyển sang `_memory_store` (dòng 42–45) và chạy tiếp, hệ thống trở lại stateful mà không báo lỗi. Hơn nữa, kết nối chỉ được thử *một lần* lúc import. Container agent khởi động trước Redis (ví dụ deploy trên cloud không có `depends_on`) sẽ dùng RAM mãi mãi. Production nên để `/ready` trả 503 và thử kết nối lại.
+- **Race condition:** `append_to_history` đọc cả session, sửa, rồi ghi đè. Hai request cùng session chạy song song thì message của request ghi trước bị mất. Nên dùng `RPUSH` + `LTRIM` trên một Redis list, như gợi ý `r.lrange(f"history:{user_id}", ...)` trong `CODE_LAB.md`, vì các lệnh này là nguyên tử.
+- **`turn` bị lệch 1:** `turn` được tính *sau* khi đã thêm câu hỏi hiện tại vào history, rồi lại `+1`. Câu hỏi thứ 2 trả `"turn": 3` (thấy trong output ở 5.5).
+
+### Exercise 5.4: Load balancing
+
+Chạy trong `05-scaling-reliability/production/`, có tạo `.env.local` rỗng trước:
+
+```bash
+docker compose -p k5-day14-scaling up -d --build --scale agent=3
+```
+
+```text
+NAME                       STATUS                    PORTS
+k5-day14-scaling-agent-1   Up 9 seconds (healthy)    8000/tcp
+k5-day14-scaling-agent-2   Up 8 seconds (healthy)    8000/tcp
+k5-day14-scaling-agent-3   Up 9 seconds (healthy)    8000/tcp
+k5-day14-scaling-nginx-1   Up 8 seconds              0.0.0.0:8080->80/tcp
+k5-day14-scaling-redis-1   Up 20 seconds (healthy)   6379/tcp
+```
+
+Gửi 10 request `POST /chat` qua Nginx (`localhost:8080`):
+
+```text
+Request  1 -> instance-f8e892
+Request  2 -> instance-777d9b
+Request  3 -> instance-59ca7b
+Request  4 -> instance-f8e892
+Request  5 -> instance-777d9b
+Request  6 -> instance-59ca7b
+Request  7 -> instance-f8e892
+...
+phân bố: 4 instance-f8e892 / 3 instance-777d9b / 3 instance-59ca7b
+```
+
+Nginx chia request theo vòng tròn, đều cho 3 instance. Đếm `POST /chat` trong `docker compose -p k5-day14-scaling logs agent` sau toàn bộ bài test: agent-1 = 12, agent-2 = 8, agent-3 = 13. agent-2 ít hơn vì bị tắt hai lần trong thí nghiệm ở 5.5.
+
+**Cách hoạt động:**
+- Docker Compose tạo một tên DNS `agent` trỏ tới IP của cả 3 container. Nginx phân giải tên này một lần lúc khởi động, thành 3 server trong `upstream agent_cluster`.
+- `proxy_next_upstream error timeout http_503` cùng với `proxy_next_upstream_tries 3`: khi một instance lỗi, timeout hoặc trả 503, Nginx tự gửi lại request sang instance khác.
+
+### Exercise 5.5: Test stateless
+
+```text
+$ python test_stateless.py
+Session ID: 612bdfa8-06b1-4366-9b35-b03613cdd7a6
+
+Request 1: [instance-f8e892]   Q: What is Docker?
+Request 2: [instance-777d9b]   Q: Why do we need containers?
+Request 3: [instance-59ca7b]   Q: What is Kubernetes?
+Request 4: [instance-f8e892]   Q: How does load balancing work?
+Request 5: [instance-777d9b]   Q: What is Redis used for?
+------------------------------------------------------------
+Total requests: 5
+Instances used: {'instance-f8e892', 'instance-777d9b', 'instance-59ca7b'}
+✅ All requests served despite different instances!
+
+--- Conversation History ---
+Total messages: 10
+  [user]: What is Docker?...
+  [assistant]: Container là cách đóng gói app để chạy ở mọi nơi. Build once...
+  ...
+✅ Session history preserved across all instances via Redis!
+```
+
+**Giải thích:** 5 câu hỏi cùng một `session_id` được 3 instance khác nhau xử lý xen kẽ. Dù vậy, history đọc lại có đủ 10 message (5 câu hỏi và 5 câu trả lời), đúng thứ tự. Lý do: mỗi instance đọc và ghi session trong cùng một Redis, không instance nào giữ state riêng.
+
+**Thí nghiệm thêm: tắt một instance giữa cuộc hội thoại.** `test_stateless.py` không tự tắt instance nào, nên mình tự làm:
+- agent-2 được khởi động lại trước thí nghiệm nên có ID mới là `instance-8aaebd`. Instance ID sinh ngẫu nhiên mỗi lần khởi động.
+- Mình dùng `docker kill` (SIGKILL), mô phỏng crash.
+
+```text
+turn  3 -> instance-777d9b  HTTP 200  0.133010s
+turn  4 -> instance-59ca7b  HTTP 200  0.155220s
+turn  5 -> instance-8aaebd  HTTP 200  0.114775s
+>>> 15:11:48 docker kill k5-day14-scaling-agent-2 (instance-8aaebd, SIGKILL)
+turn  6 -> instance-777d9b  HTTP 200  0.135241s
+turn  7 -> instance-59ca7b  HTTP 200  0.117431s
+turn  8 -> instance-777d9b  HTTP 200  14.522819s     ← Nginx thử instance đã chết trước
+turn  9 -> instance-59ca7b  HTTP 200  0.143203s
+turn 10 -> instance-777d9b  HTTP 200  0.125674s
+turn 11 -> instance-59ca7b  HTTP 200  0.126346s
+history count = 20
+
+nginx | [error] connect() failed (113: Host is unreachable) while connecting to upstream,
+        request: "POST /chat HTTP/1.1", upstream: "http://172.21.0.5:8000/chat"
+```
+
+(Cột `turn` lệch 1 so với số câu đã gửi, do lỗi đã nêu ở 5.3.)
+
+**Kết quả:**
+- Sau khi tắt một instance, cả 6 request còn lại đều trả 200. Cuộc hội thoại vẫn liên tục, history đủ 20 message cho 10 câu hỏi. Dữ liệu không mất vì nằm trong Redis, không nằm trong instance đã chết.
+- Có **một request mất 14.5 giây**. Nginx vẫn giữ IP của container đã chết trong danh sách upstream. Lần đầu chọn trúng IP đó, Nginx phải chờ kết nối thất bại rồi mới gửi lại sang instance khác nhờ `proxy_next_upstream`. Sau đó, Nginx đánh dấu server này hỏng (mặc định `max_fails=1`, `fail_timeout=10s`), nên các request tiếp theo đi thẳng tới 2 instance còn sống.
+- Muốn giảm độ trễ này, có thể đặt `proxy_connect_timeout 2s`, hoặc dùng một health check chủ động để loại instance chết ra khỏi upstream sớm hơn. Trên cloud, platform làm việc này bằng `/ready`.
+- `restart: unless-stopped` không tự bật lại container, vì Docker coi `docker kill` là thao tác dừng có chủ ý của người dùng. Nếu process tự crash, Docker sẽ restart container.
+
+Xong thì dọn stack: `docker compose -p k5-day14-scaling down -v`.
+
 ## AI log
 
 | Part | Hỏi AI gì | Nhận được gì | Tự sửa / tự kiểm tra |
@@ -444,3 +638,4 @@ Còn một cải tiến nên làm khi tích hợp vào app: gọi `check_budget`
 | Part 1 | Dùng Claude Code giải thích bài lab, tìm anti-pattern trong `develop/app.py` và so sánh với bản production | Danh sách anti-pattern kèm số dòng, bảng so sánh, gợi ý nguyên nhân log INFO bị mất | Tự chạy cả hai bản và gọi bằng `curl` để lấy output ở trên. Chạy lại bản production với `OPENAI_API_KEY=dummy` để xác nhận nguyên nhân mất log |
 | Part 2 | Dùng Claude Code trả lời câu hỏi về Dockerfile, giải thích multi-stage, vẽ sơ đồ stack Compose, tìm lý do không mở được cổng 80 | Câu trả lời Exercise 2.1, cách dùng file override để đổi cổng Nginx sang 8088 mà không sửa file của đề | Tự build hai image và đo dung lượng bằng `docker images`. Kiểm layer bằng `docker history`, user bằng `whoami`. Chạy stack và gọi qua Nginx bằng `curl`. Kiểm DNS nội bộ từ trong container agent |
 | Part 4 | Dùng Claude Code đọc `auth.py`, `rate_limiter.py`, `cost_guard.py`, viết cost guard lưu trong Redis | Giải thích luồng JWT, thuật toán sliding window, bản `check_budget` dùng `INCRBYFLOAT` nguyên tử | Tự gọi bằng `curl` để thấy 401/403/200/429. Thử sửa payload JWT để kiểm chữ ký. Chạy cost guard với Redis thật, gửi 50 request đồng thời và so với lời giải mẫu (41 request lọt, $20.50 so với 20 request, $10.00) |
+| Part 5 | Dùng Claude Code giải thích liveness và readiness, graceful shutdown, stateless; dựng kịch bản gửi SIGTERM và tắt instance | Cách chạy bản develop trong container Linux để gửi SIGTERM; giải thích độ trễ 14.5 giây khi Nginx thử instance đã chết | Tự chạy và đo: `/health` bị chặn 2.45 giây, request trả 200 sau SIGTERM với exit code 0. Chạy `test_stateless.py`. Tự `docker kill` một instance và đếm lại history (20 message) |
