@@ -10,7 +10,7 @@ khi dashboard vẫn báo deploy thành công. Thay vào đó coi như Redis khô
 /ready → 503, /ask → 503, và lifespan ghi log lỗi cấu hình.
 """
 import re
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import redis
 
@@ -19,19 +19,20 @@ from app.config import settings
 _USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/@\s]*@")
 
 
-def _redis_password() -> str:
+def _redis_passwords() -> set[str]:
+    """Mật khẩu ở cả dạng trong URL (percent-encoded) lẫn dạng đã giải mã mà redis-py dùng."""
     try:
-        return urlsplit(settings.redis_url).password or ""
+        raw = urlsplit(settings.redis_url).password or ""
     except ValueError:
-        return ""
+        return set()
+    return {p for p in (raw, unquote(raw)) if p}
 
 
 def sanitize_error(exc: BaseException) -> str:
     """Mô tả lỗi an toàn để ghi log: bỏ user:password trong mọi URL và mật khẩu Redis
     nếu nó xuất hiện ở bất kỳ đâu. Giữ lại host:port để vẫn chẩn đoán được."""
     text = _USERINFO.sub(r"\1***@", f"{type(exc).__name__}: {exc}")
-    password = _redis_password()
-    if password:
+    for password in sorted(_redis_passwords(), key=len, reverse=True):
         text = text.replace(password, "***")
     return text[:200]
 
